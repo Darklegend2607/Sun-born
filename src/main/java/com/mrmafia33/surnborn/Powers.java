@@ -1,5 +1,6 @@
 package com.mrmafia33.surnborn;
 
+import net.fabricmc.fabric.api.networking.v1.ServerPlayNetworking;
 import net.minecraft.block.Block;
 import net.minecraft.block.BlockState;
 import net.minecraft.block.Blocks;
@@ -8,7 +9,9 @@ import net.minecraft.component.type.PotionContentsComponent;
 import net.minecraft.entity.Entity;
 import net.minecraft.entity.EntityType;
 import net.minecraft.entity.LivingEntity;
+import net.minecraft.entity.attribute.EntityAttribute;
 import net.minecraft.entity.attribute.EntityAttributeInstance;
+import net.minecraft.entity.attribute.EntityAttributeModifier;
 import net.minecraft.entity.attribute.EntityAttributes;
 import net.minecraft.entity.damage.DamageSource;
 import net.minecraft.entity.effect.StatusEffect;
@@ -21,9 +24,12 @@ import net.minecraft.entity.projectile.*;
 import net.minecraft.entity.projectile.thrown.ThrownItemEntity;
 import net.minecraft.item.ItemStack;
 import net.minecraft.item.Items;
+import net.minecraft.particle.DustParticleEffect;
+import net.minecraft.particle.ParticleEffect;
 import net.minecraft.particle.ParticleTypes;
 import net.minecraft.registry.RegistryKey;
 import net.minecraft.registry.entry.RegistryEntry;
+import net.minecraft.registry.tag.BlockTags;
 import net.minecraft.registry.tag.DamageTypeTags;
 import net.minecraft.server.MinecraftServer;
 import net.minecraft.server.network.ServerPlayerEntity;
@@ -42,6 +48,8 @@ import net.minecraft.util.math.Box;
 import net.minecraft.util.math.Vec3d;
 import net.minecraft.world.World;
 
+import org.joml.Vector3f;
+
 import java.util.*;
 
 /** All Surnborn powers. Only the single owner (State.owner) is ever ticked. */
@@ -57,6 +65,10 @@ public final class Powers {
     static double solar = 100;
     static int flightTicks;
     static long titanReady, calamityReady, meteorReady, beamReady;
+    static Vec3d lastPos;
+
+    static final DustParticleEffect SUN_CORE = new DustParticleEffect(new Vector3f(1.0f, 0.78f, 0.2f), 1.0f);
+    static final DustParticleEffect SUN_GLOW = new DustParticleEffect(new Vector3f(1.0f, 0.9f, 0.45f), 1.6f);
 
     record Held(EntityType<?> type, ItemStack stack) {}
 
@@ -78,6 +90,28 @@ public final class Powers {
     static final Map<UUID, Fb> ghast = new HashMap<>();
     static final List<Erase> erases = new ArrayList<>();
 
+    // Titan form attribute boosts (ADD_MULTIPLIED_BASE: 1.0 = +100% = x2)
+    record Mod(RegistryEntry<EntityAttribute> attr, String name, double value) {}
+    static final List<Mod> TITAN_MODS = List.of(
+            new Mod(EntityAttributes.GENERIC_JUMP_STRENGTH, "jump", 1.1),              // jump higher
+            new Mod(EntityAttributes.GENERIC_SAFE_FALL_DISTANCE, "fall", 3.5),         // fall farther without damage
+            new Mod(EntityAttributes.GENERIC_MOVEMENT_SPEED, "speed", 1.0),            // 2x walk speed
+            new Mod(EntityAttributes.PLAYER_BLOCK_INTERACTION_RANGE, "block_reach", 3.5),
+            new Mod(EntityAttributes.PLAYER_ENTITY_INTERACTION_RANGE, "entity_reach", 3.5),
+            new Mod(EntityAttributes.GENERIC_STEP_HEIGHT, "step", 3.5));              // walk up bigger blocks
+
+    static void applyTitanMods(ServerPlayerEntity p, boolean on) {
+        for (Mod m : TITAN_MODS) {
+            EntityAttributeInstance inst = p.getAttributeInstance(m.attr());
+            if (inst == null) continue;
+            Identifier id = Identifier.of(Surnborn.ID, "titan_" + m.name());
+            boolean has = inst.hasModifier(id);
+            if (on && !has) inst.addTemporaryModifier(
+                    new EntityAttributeModifier(id, m.value(), EntityAttributeModifier.Operation.ADD_MULTIPLIED_BASE));
+            else if (!on && has) inst.removeModifier(id);
+        }
+    }
+
     // ------------------------------------------------------------------ helpers
 
     public static boolean isNight(World w) {
@@ -92,6 +126,22 @@ public final class Powers {
 
     static boolean loaded(ServerWorld w, int x, int z) {
         return w.getChunkManager().isChunkLoaded(x >> 4, z >> 4);
+    }
+
+    static final Identifier ATK_MOD = Identifier.of(Surnborn.ID, "attack_bonus");
+
+    static double curAtk = 0;
+    static EntityAttributeModifier.Operation curOp = null;
+
+    /** op ADD_VALUE = flat bonus, ADD_MULTIPLIED_TOTAL = percent (-0.4 = 40% less damage). */
+    static void setAttack(ServerPlayerEntity p, double value, EntityAttributeModifier.Operation op) {
+        EntityAttributeInstance inst = p.getAttributeInstance(EntityAttributes.GENERIC_ATTACK_DAMAGE);
+        if (inst == null) return;
+        EntityAttributeModifier cur = inst.getModifier(ATK_MOD);
+        if (value == 0) { if (cur != null) inst.removeModifier(ATK_MOD); return; }
+        if (cur != null && cur.value() == value && cur.operation() == op) return;
+        if (cur != null) inst.removeModifier(ATK_MOD);
+        inst.addTemporaryModifier(new EntityAttributeModifier(ATK_MOD, value, op));
     }
 
     static void eff(ServerPlayerEntity p, RegistryEntry<StatusEffect> e, int amp) {
@@ -128,7 +178,10 @@ public final class Powers {
     public static void strip(ServerPlayerEntity p) {
         EntityAttributeInstance sc = p.getAttributeInstance(EntityAttributes.GENERIC_SCALE);
         if (sc != null) sc.setBaseValue(1.0);
+        applyTitanMods(p, false);
+        p.getAbilities().setFlySpeed(0.05f);
         p.removeStatusEffect(StatusEffects.STRENGTH);
+        setAttack(p, 0, EntityAttributeModifier.Operation.ADD_VALUE);
         if (!p.isCreative() && !p.isSpectator()) {
             p.getAbilities().allowFlying = false;
             p.getAbilities().flying = false;
@@ -158,21 +211,22 @@ public final class Powers {
         boolean nether = w.getRegistryKey() == World.NETHER;
         boolean survival = !p.isCreative() && !p.isSpectator();
         boolean inLava = p.isInLava();
+        Vec3d vel = (lastPos == null || lastPos.squaredDistanceTo(p.getPos()) > 25) ? Vec3d.ZERO : p.getPos().subtract(lastPos);
+        lastPos = p.getPos();
 
         // Size: normal = 2 blocks tall, titan = 4.5x
         EntityAttributeInstance sc = p.getAttributeInstance(EntityAttributes.GENERIC_SCALE);
         double want = titan ? 4.5 : 2.0 / 1.8;
         if (sc != null && Math.abs(sc.getBaseValue() - want) > 1e-6) sc.setBaseValue(want);
+        applyTitanMods(p, titan);
 
-        // Passive effects
-        if (now % 5 == 0) {
-            eff(p, StatusEffects.FIRE_RESISTANCE, 0);
-            eff(p, StatusEffects.WATER_BREATHING, 0);
-            eff(p, StatusEffects.DOLPHINS_GRACE, 0);
-            if (titan) eff(p, StatusEffects.STRENGTH, 126);          // Strength 127
-            else if (nether) eff(p, StatusEffects.STRENGTH, 1);      // Strength II in the Nether
-            if (night && !titan) eff(p, StatusEffects.WEAKNESS, 1);  // night weakness in normal form
-        }
+        // Passive abilities done WITHOUT status effects (so nothing shows in the inventory)
+        if (p.isOnFire()) p.setFireTicks(0);                           // fire / lava immunity (damage blocked in allowDamage)
+        if (p.getAir() < p.getMaxAir()) p.setAir(p.getMaxAir());        // water breathing
+        if (titan) setAttack(p, 381, EntityAttributeModifier.Operation.ADD_VALUE);                       // Strength 127
+        else if (night) setAttack(p, -0.4, EntityAttributeModifier.Operation.ADD_MULTIPLIED_TOTAL);      // night weakness: 40% less melee damage
+        else if (nether) setAttack(p, 6, EntityAttributeModifier.Operation.ADD_VALUE);                   // Nether Strength II
+        else setAttack(p, 0, EntityAttributeModifier.Operation.ADD_VALUE);
 
         // Lava swimming + hunger
         if (inLava) {
@@ -189,6 +243,9 @@ public final class Powers {
 
         // Flight (creative-style), 60s cap at night until recharged by daytime or lava
         if (survival) {
+            boolean boost = p.getAbilities().flying && p.isSprinting();   // sprint = thruster boost
+            float fs = (titan ? 0.1f : 0.05f) * (boost ? 2.0f : 1.0f);
+            if (p.getAbilities().getFlySpeed() != fs) { p.getAbilities().setFlySpeed(fs); p.sendAbilitiesUpdate(); }
             if (!night || inLava) { flightTicks = 0; flightLocked = false; }
             boolean allow = !flightLocked;
             if (p.getAbilities().allowFlying != allow) {
@@ -197,7 +254,7 @@ public final class Powers {
                 p.sendAbilitiesUpdate();
             }
             if (p.getAbilities().flying) {
-                w.spawnParticles(ParticleTypes.SMALL_FLAME, p.getX(), p.getY() + 0.1, p.getZ(), 3, 0.15, 0.05, 0.15, 0.01);
+                jets(p, w, vel, boost);
                 if (night) {
                     flightTicks++;
                     if (flightTicks >= 1200) { flightLocked = true; msg(p, "Your flight fades with the night..."); }
@@ -206,24 +263,13 @@ public final class Powers {
         }
 
         // Crown of Helios (daytime / Nether, normal form, not underwater)
-        if (!titan && !night && !p.isSubmergedInWater() && now % 2 == 0) {
-            int n = nether ? 24 : 12;
-            double r = nether ? 0.5 : 0.4;
-            double a0 = now * 0.15;
-            double y = p.getY() + 2.1;
-            for (int i = 0; i < n; i++) {
-                double a = a0 + Math.PI * 2 * i / n;
-                w.spawnParticles(ParticleTypes.FLAME, p.getX() + Math.cos(a) * r, y, p.getZ() + Math.sin(a) * r, 1, 0, 0, 0, 0);
-            }
-            if (nether) w.spawnParticles(ParticleTypes.LAVA, p.getX(), y + 0.2, p.getZ(), 1, 0.3, 0.1, 0.3, 0);
-        }
+        if (!titan && !night && !p.isSubmergedInWater() && now % 3 == 0) crown(p, w, vel, nether);
 
         // Solar Reserve (no daylight regen at night)
         if (!night) solar = Math.min(100, solar + 0.25);
-        if (now % 10 == 0) {
-            String s = "Solar Reserve " + (int) solar + "/100";
-            if (night && p.getAbilities().flying) s += "   Flight " + Math.max(0, (1200 - flightTicks) / 20) + "s";
-            msg(p, s);
+        if (now % 4 == 0) {
+            int left = (night && survival) ? Math.max(0, (1200 - flightTicks) / 20) : 999;
+            ServerPlayNetworking.send(p, new SolarPayload((int) solar, left));
         }
 
         capture(p, w);
@@ -276,6 +322,65 @@ public final class Powers {
                 .add(look.multiply(0.5 * s));
     }
 
+    // ------------------------------------------------------------------ visuals
+
+    static void flame(ServerWorld w, ParticleEffect t, double x, double y, double z, Vec3d vel) {
+        // count 0 = the offsets are the particle's velocity, so it moves along with the player (no trail)
+        w.spawnParticles(t, x, y, z, 0, vel.x, vel.y, vel.z, 1.0);
+    }
+
+    /** A real crown made of fire: a ring with five pointed spikes. */
+    static void crown(ServerPlayerEntity p, ServerWorld w, Vec3d vel, boolean nether) {
+        double cx = p.getX() + vel.x, cy = p.getY() + 2.1 + vel.y, cz = p.getZ() + vel.z;
+        double r = 0.32;
+        int n = nether ? 20 : 14;
+        for (int i = 0; i < n; i++) {
+            double a = Math.PI * 2 * i / n;
+            flame(w, ParticleTypes.SMALL_FLAME, cx + Math.cos(a) * r, cy, cz + Math.sin(a) * r, vel);
+            if (nether) flame(w, ParticleTypes.SMALL_FLAME, cx + Math.cos(a) * r, cy + 0.07, cz + Math.sin(a) * r, vel);
+        }
+        double spike = nether ? 0.45 : 0.32;
+        int steps = nether ? 5 : 4;
+        for (int k = 0; k < 5; k++) {
+            double a = Math.PI * 2 * k / 5;
+            for (int j = 1; j <= steps; j++) {
+                double h = spike * j / steps;
+                double rr = r + h * 0.25;
+                ParticleEffect type = j == steps ? ParticleTypes.FLAME : ParticleTypes.SMALL_FLAME;
+                flame(w, type, cx + Math.cos(a) * rr, cy + h, cz + Math.sin(a) * rr, vel);
+            }
+        }
+    }
+
+    /** Iron Man style thrusters: flames from both hands and both feet. */
+    static void jets(ServerPlayerEntity p, ServerWorld w, Vec3d vel, boolean boost) {
+        double s = p.getScale();
+        double yaw = Math.toRadians(p.getYaw());
+        double fx = -Math.sin(yaw), fz = Math.cos(yaw);   // forward
+        double rx = -Math.cos(yaw), rz = -Math.sin(yaw);  // right
+        int n = boost ? 3 : 2;
+        double down = boost ? -0.45 : -0.3;
+        for (int side = -1; side <= 1; side += 2) {
+            // hands
+            double hx = p.getX() + rx * 0.42 * s * side + fx * 0.1 * s;
+            double hz = p.getZ() + rz * 0.42 * s * side + fz * 0.1 * s;
+            double hy = p.getY() + 0.8 * s;
+            for (int i = 0; i < n; i++) {
+                double j = (p.getRandom().nextDouble() - 0.5) * 0.06;
+                w.spawnParticles(ParticleTypes.FLAME, hx + j, hy, hz + j, 0, vel.x * 0.5, down, vel.z * 0.5, 1.0);
+            }
+            w.spawnParticles(SUN_CORE, hx, hy, hz, 0, vel.x * 0.5, down * 0.8, vel.z * 0.5, 1.0);
+            // feet
+            double ex = p.getX() + rx * 0.15 * s * side;
+            double ez = p.getZ() + rz * 0.15 * s * side;
+            for (int i = 0; i < n + 1; i++) {
+                double j = (p.getRandom().nextDouble() - 0.5) * 0.08;
+                w.spawnParticles(i == 0 ? ParticleTypes.FLAME : ParticleTypes.SMALL_FLAME, ex + j, p.getY() + 0.05, ez + j,
+                        0, vel.x * 0.5, down - 0.1, vel.z * 0.5, 1.0);
+            }
+        }
+    }
+
     static void hover(ServerPlayerEntity p, ServerWorld w, long now) {
         if (held.isEmpty()) return;
         if (now % 2 == 0) {
@@ -286,11 +391,11 @@ public final class Powers {
                 w.spawnParticles(ParticleTypes.FLAME, a.x, a.y, a.z, 1, 0.12, 0.12, 0.12, 0.0);
             }
         }
-        // Julius Novachrono "Chronostasis" hum: conduit + lodestone ticking
-        if (now % 8 == 0)
-            w.playSound(null, p.getX(), p.getY(), p.getZ(), SoundEvents.BLOCK_CONDUIT_AMBIENT_SHORT, SoundCategory.PLAYERS, 1f, 2f);
-        if (now % 4 == 0)
-            w.playSound(null, p.getX(), p.getY(), p.getZ(), SoundEvents.BLOCK_LODESTONE_HIT, SoundCategory.PLAYERS, 0.5f, 2f);
+        // Soft futuristic crystal hum
+        if (now % 12 == 0)
+            w.playSound(null, p.getX(), p.getY(), p.getZ(), SoundEvents.BLOCK_AMETHYST_BLOCK_RESONATE, SoundCategory.PLAYERS, 0.7f, 1.6f);
+        if (now % 24 == 0)
+            w.playSound(null, p.getX(), p.getY(), p.getZ(), SoundEvents.BLOCK_AMETHYST_BLOCK_CHIME, SoundCategory.PLAYERS, 0.4f, 2.0f);
     }
 
     static void release(ServerPlayerEntity p) {
@@ -359,10 +464,8 @@ public final class Powers {
         if (now < titanReady) return;
         titanReady = now + 20;
         titan = !titan;
-        if (titan) eff(p, StatusEffects.STRENGTH, 126);
-        else p.removeStatusEffect(StatusEffects.STRENGTH);
-        ServerWorld w = p.getServerWorld();
-        w.playSound(null, p.getX(), p.getY(), p.getZ(), SoundEvents.ENTITY_ENDER_DRAGON_GROWL, SoundCategory.PLAYERS, 0.8f, titan ? 0.6f : 1.2f);
+        p.getServerWorld().playSound(null, p.getX(), p.getY(), p.getZ(),
+                titan ? SoundEvents.BLOCK_BEACON_ACTIVATE : SoundEvents.BLOCK_BEACON_DEACTIVATE, SoundCategory.PLAYERS, 1.0f, 1.0f);
         msg(p, titan ? "Titan Form" : "Normal Form");
     }
 
@@ -373,23 +476,29 @@ public final class Powers {
             if (solar < 20) { msg(p, "Not enough Solar Reserve"); return; }
             solar -= 20;
         }
-        beamReady = now + 6;
+        beamReady = now + 10;
         Vec3d eye = p.getEyePos();
         Vec3d look = p.getRotationVec(1f);
         HitResult hr = p.raycast(48.0, 1f, false);
         double dist = hr.getPos().distanceTo(eye);
-        for (double d = 1; d <= dist; d += 0.5) {
-            Vec3d pt = eye.add(look.multiply(d)).add(0, -0.2, 0);
-            w.spawnParticles(ParticleTypes.END_ROD, pt.x, pt.y, pt.z, 1, 0, 0, 0, 0);
-            w.spawnParticles(ParticleTypes.FLAME, pt.x, pt.y, pt.z, 1, 0.05, 0.05, 0.05, 0.0);
+        // Sunlight beacon-style beam: dense golden core with a soft glow
+        int idx = 0;
+        for (double d = 0.8; d <= dist; d += 0.4, idx++) {
+            Vec3d pt = eye.add(look.multiply(d)).add(0, -0.25, 0);
+            w.spawnParticles(SUN_CORE, pt.x, pt.y, pt.z, 3, 0.07, 0.07, 0.07, 0.0);
+            w.spawnParticles(SUN_GLOW, pt.x, pt.y, pt.z, 1, 0.18, 0.18, 0.18, 0.0);
+            if (idx % 3 == 0) w.spawnParticles(ParticleTypes.END_ROD, pt.x, pt.y, pt.z, 1, 0.03, 0.03, 0.03, 0.0);
         }
+        Vec3d end = hr.getPos();
+        w.spawnParticles(ParticleTypes.FLAME, end.x, end.y, end.z, 14, 0.35, 0.35, 0.35, 0.05);
+        w.spawnParticles(ParticleTypes.END_ROD, end.x, end.y, end.z, 8, 0.3, 0.3, 0.3, 0.1);
         Box b = new Box(eye, eye.add(look.multiply(dist))).expand(1.5);
         for (LivingEntity e : w.getEntitiesByClass(LivingEntity.class, b, x -> x != p && x.isAlive() && !friendly(p, x))) {
             Vec3d to = e.getBoundingBox().getCenter().subtract(eye);
             double proj = to.dotProduct(look);
             if (proj < 0 || proj > dist + 1) continue;
             if (to.subtract(look.multiply(proj)).length() > 1.0 + e.getWidth() / 2) continue;
-            safeDamage(e, w.getDamageSources().indirectMagic(p, p), titan ? 40f : 14f);
+            safeDamage(e, w.getDamageSources().indirectMagic(p, p), titan ? 50f : 18f);
             e.setOnFireFor(6);
         }
         w.playSound(null, p.getX(), p.getY(), p.getZ(), SoundEvents.BLOCK_BEACON_ACTIVATE, SoundCategory.PLAYERS, 0.8f, 2f);
@@ -446,21 +555,30 @@ public final class Powers {
             if (e.isAlive()) e.kill();
         }
 
-        // Magma crater with fire; cools to stone after exactly 2 minutes (see tickCraters)
+        // Magma crater with fire; cools to stone after exactly 2 minutes (see tickCraters).
+        // Works on any ground: ice, snow, leaves, glass... (leaves/snow/plants above the floor are cleared)
         int R = 5;
         for (int dx = -R; dx <= R; dx++)
             for (int dz = -R; dz <= R; dz++) {
                 if (dx * dx + dz * dz > R * R) continue;
                 int x = tgt.getX() + dx, z = tgt.getZ() + dz;
                 if (!loaded(w, x, z)) continue;
-                for (int y = tgt.getY() + 3; y >= tgt.getY() - 3; y--) {
+                for (int y = tgt.getY() + 3; y >= tgt.getY() - 10; y--) {
                     BlockPos pos = new BlockPos(x, y, z);
                     BlockState s = w.getBlockState(pos);
-                    if (s.isAir() || !s.getFluidState().isEmpty() || s.isOf(Blocks.BEDROCK) || !s.isSolidBlock(w, pos)) continue;
-                    BlockPos up = pos.up();
-                    if (!w.getBlockState(up).isAir()) continue;
+                    if (s.isAir() || !s.getFluidState().isEmpty() || s.isOf(Blocks.BEDROCK)) continue;
+                    if (s.isReplaceable() || s.isIn(BlockTags.LEAVES) || s.getCollisionShape(w, pos).isEmpty()) continue;
+                    // clear leaves / snow / plants standing on the floor
+                    for (int up = 1; up <= 4; up++) {
+                        BlockPos q = pos.up(up);
+                        BlockState qs = w.getBlockState(q);
+                        if (!qs.isAir() && !qs.isOf(Blocks.BEDROCK)
+                                && (qs.isReplaceable() || qs.isIn(BlockTags.LEAVES) || qs.getCollisionShape(w, q).isEmpty()))
+                            w.setBlockState(q, Blocks.AIR.getDefaultState(), FLAGS);
+                    }
                     w.setBlockState(pos, Blocks.MAGMA_BLOCK.getDefaultState());
-                    w.setBlockState(up, Blocks.FIRE.getDefaultState());
+                    BlockPos above = pos.up();
+                    if (w.getBlockState(above).isAir()) w.setBlockState(above, Blocks.FIRE.getDefaultState());
                     State.craters.add(new State.Crater(w.getRegistryKey(), pos.asLong(), now + 2400));
                     break;
                 }
@@ -613,6 +731,7 @@ public final class Powers {
         // Incoming: owner protections
         if (entity instanceof ServerPlayerEntity pl && State.isOwner(pl)) {
             if (src.isIn(DamageTypeTags.BYPASSES_INVULNERABILITY)) return true;
+            if (src.isIn(DamageTypeTags.IS_FIRE)) return false;             // fire / lava immunity
 
             if (direct instanceof ProjectileEntity pe
                     && !(pe instanceof FireballEntity f && f.getOwner() instanceof GhastEntity)) {

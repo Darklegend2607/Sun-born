@@ -42,6 +42,7 @@ public class Surnborn implements ModInitializer {
     public void onInitialize() {
         // Networking (custom keybinds -> server)
         PayloadTypeRegistry.playC2S().register(KeyPayload.ID, KeyPayload.CODEC);
+        PayloadTypeRegistry.playS2C().register(SolarPayload.ID, SolarPayload.CODEC);
         ServerPlayNetworking.registerGlobalReceiver(KeyPayload.ID,
                 (payload, ctx) -> Powers.onKey(ctx.player(), payload.action()));
 
@@ -95,7 +96,8 @@ public class Surnborn implements ModInitializer {
         d.register(CommandManager.literal("surnborn")
                 .then(CommandManager.literal("choose").executes(c -> choose(c.getSource())))
                 .then(CommandManager.literal("release").executes(c -> release(c.getSource())))
-                .then(CommandManager.literal("status").executes(c -> status(c.getSource()))));
+                .then(CommandManager.literal("status").executes(c -> status(c.getSource())))
+                .then(CommandManager.literal("debug").executes(c -> debug(c.getSource()))));
     }
 
     private static int choose(ServerCommandSource s) throws CommandSyntaxException {
@@ -132,6 +134,21 @@ public class Surnborn implements ModInitializer {
         Powers.reset();
         State.save(s.getServer());
         s.sendFeedback(() -> Text.literal("Surnborn origin released."), true);
+        return 1;
+    }
+
+    /** Prints the numbers that decide melee damage, to help find problems. */
+    private static int debug(ServerCommandSource s) throws CommandSyntaxException {
+        ServerPlayerEntity p = s.getPlayerOrThrow();
+        String[] lines = {
+                "owner: " + State.isOwner(p) + "   titan: " + Powers.titan + "   night: " + Powers.isNight(p.getServerWorld()),
+                "attack damage: " + p.getAttributeValue(net.minecraft.entity.attribute.EntityAttributes.GENERIC_ATTACK_DAMAGE),
+                "attack speed: " + p.getAttributeValue(net.minecraft.entity.attribute.EntityAttributes.GENERIC_ATTACK_SPEED),
+                "attack cooldown (0-1): " + p.getAttackCooldownProgress(0.5f),
+                "hit reach: " + p.getEntityInteractionRange() + "   scale: " + p.getScale(),
+                "fall distance: " + p.fallDistance + "   can fly: " + p.getAbilities().allowFlying + "   flying: " + p.getAbilities().flying
+        };
+        for (String l : lines) s.sendFeedback(() -> Text.literal(l), false);
         return 1;
     }
 
