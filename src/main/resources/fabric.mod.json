@@ -1,0 +1,20 @@
+{
+  "schemaVersion": 1,
+  "id": "surnborn",
+  "version": "${version}",
+  "name": "Surnborn Origin",
+  "description": "Standalone Surnborn origin. Author: Mr_mafia33",
+  "authors": ["Mr_mafia33"],
+  "license": "All-Rights-Reserved",
+  "environment": "*",
+  "entrypoints": {
+    "main": ["com.mrmafia33.surnborn.Surnborn"],
+    "client": ["com.mrmafia33.surnborn.SurnbornClient"]
+  },
+  "depends": {
+    "fabricloader": ">=0.16.0",
+    "minecraft": "~1.21.1",
+    "java": ">=21",
+    "fabric-api": "*"
+  }
+}
